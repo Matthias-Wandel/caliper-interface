@@ -1,4 +1,4 @@
-// Decode digital caliper syncronous serial output on Raspberry Pi
+// Decode digital caliper synchronous serial output on Raspberry Pi
 // by Matthias Wandel
 // https://github.com/Matthias-Wandel/caliper-interface
 //
@@ -16,7 +16,7 @@
 // 3  Data
 // 4  Ground
 
-// caliper outputs two 24 bit words with syncronous serial at 76.8 kbaud.
+// caliper outputs two 24 bit words with synchronous serial at 76.8 kbaud.
 
 // Pinout of header connector to Pi:
 //
@@ -35,7 +35,7 @@
 //                          +- 1.5 V --+
 //                           To calliper
 
-// Calliper puts out two 24 bit words, syncronous serial, 76.8 kbits per second. 
+// Calliper puts out two 24 bit words, synchronous serial, 76.8 kbits per second.
 // These are LSB first, 20480 increments per inch.  First word reading
 // with zero as position where it was turned on.  Second value is the negative
 // of what is on the display.  Pushing zero on the caliper resets this values
@@ -47,10 +47,15 @@
 #include <pigpio.h>
 #include <unistd.h>
 
-#define POWER_PIN 10     // GPIO 19
-#define CLOCK_PIN 9      // GPIO 21
-#define DATA_PIN 11      // GPIO 23
 
+#define POWER_PIN 10     // Pin 19
+#define CLOCK_PIN 9      // Pin 21
+#define DATA_PIN 11      // Pin 23
+//Ground pin             // Pin 25
+
+//-----------------------------------------------------------------------------
+// GPIO setup
+//-----------------------------------------------------------------------------
 void setupGPIO() {
     if (gpioInitialise() < 0) {
         fprintf(stderr, "Failed to initialize pigpio\n");
@@ -91,9 +96,27 @@ unsigned WaitClockChangeTo(int StateToWait)
 //-----------------------------------------------------------------------------
 //
 //-----------------------------------------------------------------------------
-int main()
+int main(int argc, char *argv[])
 {
+    // Check if there is at least one argument passed
+	int SingleReadingMode = 0;
+	int OffAfter = 0;
+	for (int n=1;n<argc;n++){
+        // Compare the first argument with "-s"
+        if (argv[n][0] == '-'){
+			if (argv[n][1] == 's') SingleReadingMode = 1;
+			if (argv[n][1] == 'o') OffAfter = 1;
+		}
+	}
+
     setupGPIO();
+
+	if (OffAfter && SingleReadingMode == 0){
+		printf("Turn off caliper supply\n");
+		gpioWrite(POWER_PIN, PI_LOW);
+		gpioTerminate();
+		return 0;
+	}
 
     while (1) {
         int errors = 0;
@@ -183,10 +206,17 @@ int main()
         }
         mm[1] = -mm[1]; // Second value is negative
 
+		if (SingleReadingMode){
+			printf("Abs:%8.3fmm  Disp:%8.3fmm\n", mm[0], mm[1]);
+			break;
+		}
+
 		printf("i1=%08x i2=%08x  ", rx_words[0], rx_words[1]);
-        printf("Abs:%7.3fmm  disp:%7.3fmm\n", mm[0], mm[1]);
-		usleep(1000);
+        printf("Abs:%8.3fmm  Disp:%8.3fmm\n", mm[0], mm[1]);
+		usleep(28000); // Only 3 readings per second, so might as well sleep until we get close to the next one.
     }
+
+	if (OffAfter) gpioWrite(POWER_PIN, PI_LOW);
 
     gpioTerminate();
     return 0;
