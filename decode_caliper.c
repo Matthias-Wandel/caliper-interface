@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <pigpio.h>
 #include <unistd.h>
+#include <signal.h>
 
 
 #define POWER_PIN 10     // Pin 19
@@ -66,6 +67,19 @@ void setupGPIO() {
     gpioSetMode(CLOCK_PIN, PI_INPUT);
     gpioSetMode(DATA_PIN, PI_INPUT);
 }
+
+//-----------------------------------------------------------------------------
+// Signal handler to do pigpioTerminate on control-c
+//-----------------------------------------------------------------------------
+void handle_sigint(int sig) {
+    printf("\nCaught signal %d, shutting down pigpio...\n", sig);
+	// Clean up pigpio before exiting.  If we don't do this, pigpio may end
+	// up in a messed up state, requiring a reboot before it works again.
+    gpioTerminate();
+    exit(0);
+}
+
+
 
 unsigned volatile int LastClockFlip;
 
@@ -92,35 +106,13 @@ unsigned WaitClockChangeTo(int StateToWait)
 	return duration;
 }
 
-
 //-----------------------------------------------------------------------------
-//
+// Decode the two 24 bit words coming from caliprs
 //-----------------------------------------------------------------------------
-int main(int argc, char *argv[])
+int BitbangCaliperSerial(int * rx_words)
 {
-    // Check if there is at least one argument passed
-	int SingleReadingMode = 0;
-	int OffAfter = 0;
-	for (int n=1;n<argc;n++){
-        // Compare the first argument with "-s"
-        if (argv[n][0] == '-'){
-			if (argv[n][1] == 's') SingleReadingMode = 1;
-			if (argv[n][1] == 'o') OffAfter = 1;
-		}
-	}
-
-    setupGPIO();
-
-	if (OffAfter && SingleReadingMode == 0){
-		printf("Turn off caliper supply\n");
-		gpioWrite(POWER_PIN, PI_LOW);
-		gpioTerminate();
-		return 0;
-	}
-
     while (1) {
         int errors = 0;
-        int rx_words[2] = {0, 0};
         int num_words = 0;
 		LastClockFlip = gpioTick();
 
@@ -136,13 +128,13 @@ int main(int argc, char *argv[])
 		}
 
 		if (t - LastClockFlip >= 400000){
-			printf("timed out waiting for clock high\n");
+			//printf("timed out waiting for clock high\n");
 			continue;
 		}
 
 		if (t - LastClockFlip <= 2000){
 			// Didn't have 2 ms of low, wait again.
-			printf("No 2 ms of low, try again\n");
+			//printf("No 2 ms of low, try again\n");
 			continue;
 		}
 
@@ -151,7 +143,7 @@ int main(int argc, char *argv[])
 
 		if (start_duration < 45){
 			errors |= 0x10000;
-			printf("Start too short %d\n", start_duration);
+			//printf("Start too short %d\n", start_duration);
 			continue;
 		}
 
@@ -173,7 +165,7 @@ int main(int argc, char *argv[])
 
 				if (gpioRead(CLOCK_PIN)) {
 					// Low clock period (bit valid period) may have ended while we read.
-					printf("Missed clock low period\n");
+					//printf("Missed clock low period\n");
 					errors += 0x01;
 					break;
 				}
@@ -186,6 +178,10 @@ int main(int argc, char *argv[])
 						printf("wrong bit count %08x\n",bitval);
 						errors += 0x100;
 					}
+
+					value &= 0xFFFFFF;
+					if (value & 0x800000) value -= 0x1000000; // Sign extend the 24 bit value
+
 					rx_words[num_words] = value;
 					num_words += 1;
 					break;
@@ -197,12 +193,48 @@ int main(int argc, char *argv[])
             printf("Error: %04x\n", errors);
             continue;
         }
+		return errors;
+	}
+}
+
+//-----------------------------------------------------------------------------
+//
+//-----------------------------------------------------------------------------
+int main(int argc, char *argv[])
+{
+    // Check if there is at least one argument passed
+	int SingleReadingMode = 0;
+	int OffAfter = 0;
+	int NumAvg = 1;
+	for (int n=1;n<argc;n++){
+        // Compare the first argument with "-s"
+        if (argv[n][0] == '-'){
+			if (argv[n][1] == 's') SingleReadingMode = 1;
+			if (argv[n][1] == 'o') OffAfter = 1;
+		}
+	}
+
+    setupGPIO();
+    // Register signal handler to do gpioTerminate on Ctrl+C
+    signal(SIGINT, handle_sigint);  // Stop via control-C
+	signal(SIGTERM, handle_sigint); // Stpo via kill command
+	signal(SIGTSTP, handle_sigint);  // Suspend with ctrl-Z - just quit
+
+
+	if (OffAfter && SingleReadingMode == 0){
+		printf("Turn off caliper supply\n");
+		gpioWrite(POWER_PIN, PI_LOW);
+		gpioTerminate();
+		return 0;
+	}
+
+	while (1){
+		int rx_words[2];
+		BitbangCaliperSerial(rx_words);
 
         double mm[2];
         for (int n = 0; n < 2; n++) {
-            int32_t v = rx_words[n] & 0xFFFFFF;
-            if (v & 0x800000) v -= 0x1000000; // Sign extend
-            mm[n] = v * 0.00124023; // Convert to mm (reads 20480 increments per inch)
+            mm[n] = rx_words[n] * 0.00124023; // Convert to mm (reads 20480 increments per inch)
         }
         mm[1] = -mm[1]; // Second value is negative
 
@@ -211,9 +243,11 @@ int main(int argc, char *argv[])
 			break;
 		}
 
-		printf("i1=%08x i2=%08x  ", rx_words[0], rx_words[1]);
+		//printf("i1=%08x i2=%08x  ", rx_words[0], rx_words[1]);
+		printf("i1=%8d i2=%8d  ", rx_words[0], rx_words[1]);
         printf("Abs:%8.3fmm  Disp:%8.3fmm\n", mm[0], mm[1]);
-		usleep(28000); // Only 3 readings per second, so might as well sleep until we get close to the next one.
+		usleep(300000); // Only 3 readings per second, so might as well sleep
+                        // until we get close to the next one.
     }
 
 	if (OffAfter) gpioWrite(POWER_PIN, PI_LOW);
