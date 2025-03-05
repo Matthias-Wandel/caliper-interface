@@ -2,10 +2,21 @@
 // by Matthias Wandel
 // https://github.com/Matthias-Wandel/caliper-interface
 //
+// This developed and tested on a Raspberry Pi 3A+.  Should run fine on
+// anything faster.  Timing primarily limited by calls to teh I/O library,
+// so this code may well run faster on a Pi Pico as it doesn't have a
+// system call overhead.
+//
+// This assumes calipers that send postion as two 24 bit words at 77 k baud.
+// Cheap calipers either use this scheme or they send one 24 bit value which is
+// encoded as 0.01 mm increments.  This assumes the former.
+
+//
 // Compiling:
 //    gcc -o decode_caliper decode_caliper.c -lpigpio
 //
 // Must run as root.
+
 
 
 // Pinout of header connector on calipers, left to right,
@@ -34,10 +45,16 @@
 //                          |          |
 //                          +- 1.5 V --+
 //                           To calliper
+//
+// For electrically noisy enviroments, a .1 uF cap between ground and
+// caliper's plus terminal helps.
 
 // Calliper puts out two 24 bit words, synchronous serial, 76.8 kbits per second.
-// These are LSB first, 20480 increments per inch.  First word reading
-// with zero as position where it was turned on.  Second value is the negative
+// These are LSB first, 20480 increments per inch.  First word is an absolute
+// position reading  where it was turned on, typically starting around 7430000
+// However, this value modulo 5 mm is in fact absolute even across power down.
+
+// The Second value is the negative
 // of what is on the display.  Pushing zero on the caliper resets this values
 // to zero for the current position.
 
@@ -49,10 +66,20 @@
 #include <signal.h>
 
 
-#define POWER_PIN 10     // Pin 19
-#define CLOCK_PIN 9      // Pin 21
-#define DATA_PIN 11      // Pin 23
-//Ground pin             // Pin 25
+#define POWER_GPIO 10     // Pin 19
+#define CLOCK_GPIO 9      // Pin 21
+#define DATA_GPIO 11      // Pin 23
+//Ground pin              // Pin 25
+
+
+// Error value is divided into bit fields and can contain multiple errors
+#define ERR_GLITCH_COUNT          0x00000001 // 16 bits for glitch count (it can get to 2000 and still decode)
+#define ERR_TOO_LATE_FOR_CLOCK    0x00010000 // Possibly missed clock period (Pi is too slow)
+#define ERR_START_TOO_SHORT       0x00100000
+#define ERR_START_TOO_LONG        0x00200000
+#define ERR_WRONG_BIT_COUNT       0x00400000 // Mostlikely due to missed clock periods from not being real-time.
+#define ERR_CLOCK_STUCK_LOW       0x01000000 // Clock is not changing at all
+#define ERR_TIMEOUT               0x40000000
 
 //-----------------------------------------------------------------------------
 // GPIO setup
@@ -62,10 +89,10 @@ void setupGPIO() {
         fprintf(stderr, "Failed to initialize pigpio\n");
         exit(1);
     }
-    gpioSetMode(POWER_PIN, PI_OUTPUT);
-    gpioWrite(POWER_PIN, PI_HIGH);
-    gpioSetMode(CLOCK_PIN, PI_INPUT);
-    gpioSetMode(DATA_PIN, PI_INPUT);
+    gpioSetMode(POWER_GPIO, PI_OUTPUT);
+    gpioWrite(POWER_GPIO, PI_HIGH);
+    gpioSetMode(CLOCK_GPIO, PI_INPUT);
+    gpioSetMode(DATA_GPIO, PI_INPUT);
 }
 
 //-----------------------------------------------------------------------------
@@ -79,126 +106,133 @@ void handle_sigint(int sig) {
     exit(0);
 }
 
-
-
-unsigned volatile int LastClockFlip;
-
-unsigned volatile int t1, t2, t3;
 //-----------------------------------------------------------------------------
 // Wait for clock to change state
 //-----------------------------------------------------------------------------
 unsigned WaitClockChangeTo(int StateToWait)
 {
 	int t;
-	for(;;){
+	int n = 0;
+	int errors = 0;
+
+	for(int maxr=0;;maxr++){
 		t = gpioTick();
 
-		if (gpioRead(CLOCK_PIN) == StateToWait) break;
+		if (gpioRead(CLOCK_GPIO) == StateToWait){
+			n += 1;
+			if (n >= 3){
+				if (maxr < 5){
+					// Clock was already in that state (glitches notwithstanding),
+					// we may be a bit late.
+					errors += ERR_TOO_LATE_FOR_CLOCK;
+				}
+				break;
+			}
+		}else{
+			if (n){
+				n = 0;
+				errors += ERR_GLITCH_COUNT;
+			}
+		}
 
-		if (t-LastClockFlip > 1000){
-			// Timeout.
-			LastClockFlip = t;
-			return 0;
+		if (maxr >= 10000000){
+			errors |= ERR_TIMEOUT;
+			break;
 		}
 	}
-	int duration = t-LastClockFlip;
-	LastClockFlip = t;
-	return duration;
+	return errors;
 }
 
 //-----------------------------------------------------------------------------
-// Decode the two 24 bit words coming from caliprs
+// Decode the two 24 bit words coming from caliprs.  These are syncronous serial
+// at 76 kbaud, in units of 20480 per inch.
 //-----------------------------------------------------------------------------
-int BitbangCaliperSerial(int * rx_words)
+int BitBangCaliperSerial(int * rx_words)
 {
-    while (1) {
-        int errors = 0;
-        int num_words = 0;
+    int errors = 0;
+    int num_words = 0;
+	int LastClockFlip = gpioTick();
+
+	int t;
+	int duration;
+
+	while (1){
 		LastClockFlip = gpioTick();
-
-		int t;
-
-		while (gpioRead(CLOCK_PIN) == 0){ // Wait for high
-			t = gpioTick();
-
-			if (t - LastClockFlip > 400000){
-				// Timeout.
-				printf("Not seeing clock go high\n");
-			}
-		}
-
-		if (t - LastClockFlip >= 400000){
-			//printf("timed out waiting for clock high\n");
-			continue;
-		}
-
-		if (t - LastClockFlip <= 2000){
-			// Didn't have 2 ms of low, wait again.
-			//printf("No 2 ms of low, try again\n");
-			continue;
+		errors += WaitClockChangeTo(1);
+		duration = gpioTick() - LastClockFlip;
+		if (duration > 400000){
+			// should see something at least 3x per second.
+			errors |= ERR_CLOCK_STUCK_LOW;
+			return errors;
 		}
 
 		LastClockFlip = gpioTick();
-		int start_duration = WaitClockChangeTo(0);
-
-		if (start_duration < 45){
-			errors |= 0x10000;
-			//printf("Start too short %d\n", start_duration);
-			continue;
+		errors += WaitClockChangeTo(0);
+		duration = gpioTick()-LastClockFlip;
+		if (duration <= 1){
+			// Going high this briefly is most likely a glitch.
+			errors += ERR_GLITCH_COUNT;
+		}else{
+			break;
 		}
+	}
 
-		if (start_duration > 60){
-			errors |= 0x10000;
-			printf("Start too long\n");
-			continue;
-		}
-
-		while (num_words < 2) {
-			int value = 0;
-			int bitval = 1;
-
-			while (bitval < 0x10000000) {
-				if (gpioRead(DATA_PIN)) {
-					value |= bitval;
-				}
-			    bitval <<= 1;
-
-				if (gpioRead(CLOCK_PIN)) {
-					// Low clock period (bit valid period) may have ended while we read.
-					//printf("Missed clock low period\n");
-					errors += 0x01;
-					break;
-				}
-
-				WaitClockChangeTo(1);
-				int duration = WaitClockChangeTo(0);
-
-				if (duration > 20) {
-					if (bitval != 0x1000000){
-						printf("wrong bit count %08x\n",bitval);
-						errors += 0x100;
-					}
-
-					value &= 0xFFFFFF;
-					if (value & 0x800000) value -= 0x1000000; // Sign extend the 24 bit value
-
-					rx_words[num_words] = value;
-					num_words += 1;
-					break;
-				}
-			}
-        }
-
-        if (errors) {
-            printf("Error: %04x\n", errors);
-            continue;
-        }
+	if (duration < 45){
+		errors |= ERR_START_TOO_SHORT;
+		//printf("Start too short %d\n", duration);
 		return errors;
 	}
+
+	if (duration > 60){
+		errors |= ERR_START_TOO_LONG;
+		//printf("Start too long\n");
+		return errors;
+	}
+
+	while (num_words < 2) {
+		int value = 0;
+		int bitval = 1;
+
+		while (bitval < 0x10000000) {
+
+			const int num_average = 3; // Could do more reads on pi 4 or 5
+			int sum = 0;
+			for (int i=0;i<num_average;i++) sum += gpioRead(DATA_GPIO);
+
+			if (sum > num_average/2) value |= bitval;
+		    bitval <<= 1;
+			if (sum > 1 && sum < num_average){
+				// Glitches on the data line are more worriesome, so count those as 4x.
+				errors += ERR_WRONG_BIT_COUNT*4;
+			}
+
+			errors += WaitClockChangeTo(1);
+			if (errors & ERR_TIMEOUT) break;
+			LastClockFlip = gpioTick();
+			errors += WaitClockChangeTo(0);
+			if (errors & ERR_TIMEOUT) break;
+			int duration = gpioTick()-LastClockFlip;
+
+			if (duration > 20) {
+				if (bitval != 0x1000000){
+					//printf("wrong bit count %08x\n",bitval);
+					errors += ERR_WRONG_BIT_COUNT;
+				}
+
+				value &= 0xFFFFFF;
+				if (value & 0x800000) value -= 0x1000000; // Sign extend the 24 bit value
+
+				rx_words[num_words] = value;
+				num_words += 1;
+				break;
+			}
+		}
+    }
+	return errors;
 }
 
 //-----------------------------------------------------------------------------
-//
+// Mainline
 //-----------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
@@ -220,37 +254,47 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, handle_sigint); // Stpo via kill command
 	signal(SIGTSTP, handle_sigint);  // Suspend with ctrl-Z - just quit
 
-
 	if (OffAfter && SingleReadingMode == 0){
 		printf("Turn off caliper supply\n");
-		gpioWrite(POWER_PIN, PI_LOW);
+		gpioWrite(POWER_GPIO, PI_LOW);
 		gpioTerminate();
 		return 0;
 	}
 
 	while (1){
 		int rx_words[2];
-		BitbangCaliperSerial(rx_words);
+		int errors = BitBangCaliperSerial(rx_words);
+		if (errors > 0x100000){
+			printf("Decode fail, error %x\n",errors);
+			// Larger errors mean decoding must have failed.
+			usleep(5000); // sleep past of rest of the serial message before trying again.
+			continue;
+		}
 
         double mm[2];
         for (int n = 0; n < 2; n++) {
-            mm[n] = rx_words[n] * 0.00124023; // Convert to mm (reads 20480 increments per inch)
+            mm[n] = rx_words[n] * (25.4/20480); // Convert to mm (reads 20480 increments per inch)
         }
         mm[1] = -mm[1]; // Second value is negative
 
-		if (SingleReadingMode){
-			printf("Abs:%8.3fmm  Disp:%8.3fmm\n", mm[0], mm[1]);
-			break;
-		}
-
 		//printf("i1=%08x i2=%08x  ", rx_words[0], rx_words[1]);
 		printf("i1=%8d i2=%8d  ", rx_words[0], rx_words[1]);
-        printf("Abs:%8.3fmm  Disp:%8.3fmm\n", mm[0], mm[1]);
-		usleep(300000); // Only 3 readings per second, so might as well sleep
-                        // until we get close to the next one.
+        printf("Abs:%8.3fmm  Disp:%8.3fmm", mm[0], mm[1]);
+		if (errors) printf("  Glitches: %x",errors);
+		putchar('\n');
+
+		if (SingleReadingMode) break;
+		if (errors == 0){
+			// After successful decode, safe to sleep till next one should come.
+			usleep(300000); // Only 3 readings per second, so might as well sleep
+							// until we get close to the next one.
+		}
     }
 
-	if (OffAfter) gpioWrite(POWER_PIN, PI_LOW);
+	if (OffAfter){
+		printf("Turning off caliper supply\n");
+		gpioWrite(POWER_GPIO, PI_LOW);
+	}
 
     gpioTerminate();
     return 0;
