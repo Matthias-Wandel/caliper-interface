@@ -9,7 +9,7 @@ on the circuit board.  These can be used to connect the caliper to a computer.
 A lot of these calipers have part of the plastic cover that can be slid off to reveal
 four pads on the circuit board.  The geometry of this opening varies, and I don't
 know of where one could buy a connector to fit.
-Even if there is no lid that comes off, its very likely that these four pads are still
+Even if there is no lid that comes off, it's very likely that these four pads are still
 present in that location.  I haven't seen calipers without them.
 <p>
 
@@ -31,7 +31,7 @@ Looking at top of PCB with the edge connector traces facing you:
 </table>
 <p>
 
-As these calipers don't cost much, and no suitable connector,
+As these calipers don't cost much, and no suitable connector exists,
 I just soldered wires to the pads, then applied hot glue
 to keep the wire from bending at the solder joints so they won't break.
 <p>
@@ -53,9 +53,9 @@ is 1.8 volts, so even 1.5 volts from the caliper is not enough to
 register as high (1) for the Raspbery Pi.
 <p>
 A voltage divider with 1.3k to ground, 2k across supply of caliper
-and 1k to +3.3 volts puts the 1.5 volt supply if the caliper so that it
+and 1k to +3.3 volts puts the 1.5 volt supply of the caliper so that it
 straddles the 1.8 volts hi/low GPIO input threshold of the Pi.  This voltage divider
-also provides power to the caliper, as the calipers only us 10-15 µA, and
+also provides power to the caliper, as the calipers only use 10-15 µA, and
 I don't like to leave batteries in them as they drain the batteries in about a
 year because turning them "off" only turns off the display.
 <p>
@@ -72,7 +72,7 @@ Gnd ---\/\/\/----\/\/\/--+--\/\/\/--+--\/\/\/---- 3.3V
 I soldered the four resistors for the voltage divider onto a four pin
 header that plugs into the Raspbery Pi.  Breadboard is fine for experimenting
 but if I want to use something, I prefer to just solder it together compactly.
-I already have some heat shrink tubing ready to slide over two of the resistors,
+I already have some heat shrink tubing ready to slide over two of the resistors;
 more heat shrink tubing was added later.
 <p>
 <img src="pix/resistors.jpg">
@@ -89,7 +89,7 @@ more heat shrink tubing was added later.
 Here plugged into pins 19,21,23 and 25 on the Raspberry Pi 4.  These are the pins
 my code assumes.  I chose these pins to not interfere with other peripherals that
 I have plugged into the Raspbery Pi on my setup.  I just use
-general purpose GPIO pins, so the connector could be plugged just about anyhere
+general purpose GPIO pins, so the connector could be plugged just about anywhere
 onto the 40 pin header if the code is changed accordingly.  I drive one output to high
 to provide power for the voltage divider as I didn't want to use up one of the
 3.3 volt supply pins on the header.  I often have multiple sensors and such connected
@@ -114,20 +114,20 @@ So I re-wrote it in c, <b>decode_caliper.c</b>.  Unlike the python program, this
 to run as root.
 <p>
 I used this for checking the accuracy of my CNC router, but I found once the servos were
-turned on, there was a lot of electrical noise.  Connecting the caliperss frame to ground
+turned on, there was a lot of electrical noise.  Connecting the caliper's frame to ground
 through a 0.1 µF capacitor helped a lot.  The capacitor was necessary because the calipers
 are offset from the Pi's ground.  Also, the calipers use positive ground.
 I should have used this cap as part of my resistor divider.  Also, something like a 100 pF
-caps on the data lines to ground would probably also help a lot.
+cap on the data lines to ground would probably help a lot.
 <p>
-I ended up implementing something like switch debounce logic in my decode_calipers.c code,
+I ended up implementing something like switch debounce logic in my decode_calipers.c code.
 This is able to detect and ignore most of the glitches, even if there are hundreds of glitches
 during one read.  But electrically filtering the signals would be a better
 approach.
 <p>
-I have four digital calipers, and two of them use the protocol described here.  The other ones
+I have four digital calipers, and two of them use the protocol described here.  The other two
 just send one 24 bit value each time, and at a slower bit rate, which makes Python decoding
-more practical.  There are also various other articles on the net about this, search for
+more practical.  There are also various other articles on the net about this; search for
 "arduino digital calipers"
 
 
