@@ -73,7 +73,8 @@
 
 
 // Error value is divided into bit fields and can contain multiple errors
-#define ERR_GLITCH_COUNT          0x00000001 // 16 bits for glitch count (it can get to 2000 and still decode)
+#define ERR_CL_GLITCH_COUNT       0x00000001 // 8 bits for clock count
+#define ERR_DL_GLITCH_COUNT       0x00000100 // 8 bits for data glitch count (less likely to detect these)
 #define ERR_TOO_LATE_FOR_CLOCK    0x00010000 // Possibly missed clock period (Pi is too slow)
 #define ERR_START_TOO_SHORT       0x00100000
 #define ERR_START_TOO_LONG        0x00200000
@@ -109,19 +110,16 @@ void handle_sigint(int sig) {
 //-----------------------------------------------------------------------------
 // Wait for clock to change state
 //-----------------------------------------------------------------------------
-unsigned WaitClockChangeTo(int StateToWait)
+unsigned WaitClockChangeTo(int StateToWait, int min_n)
 {
-	int t;
 	int n = 0;
 	int errors = 0;
 
 	for(int maxr=0;;maxr++){
-		t = gpioTick();
-
 		if (gpioRead(CLOCK_GPIO) == StateToWait){
 			n += 1;
-			if (n >= 3){
-				if (maxr < 5){
+			if (n >= min_n){
+				if (maxr <= min_n){
 					// Clock was already in that state (glitches notwithstanding),
 					// we may be a bit late.
 					errors += ERR_TOO_LATE_FOR_CLOCK;
@@ -130,8 +128,8 @@ unsigned WaitClockChangeTo(int StateToWait)
 			}
 		}else{
 			if (n){
-				n = 0;
-				errors += ERR_GLITCH_COUNT;
+				n=0;
+				errors += ERR_CL_GLITCH_COUNT;
 			}
 		}
 
@@ -158,7 +156,9 @@ int BitBangCaliperSerial(int * rx_words)
 
 	while (1){
 		LastClockFlip = gpioTick();
-		errors += WaitClockChangeTo(1);
+		// Clock line floats between transmissions, specify that we want to
+		// see it high for much longer before we accept it as the starting clock high.
+		errors += WaitClockChangeTo(1,20);
 		duration = gpioTick() - LastClockFlip;
 		if (duration > 400000){
 			// should see something at least 3x per second.
@@ -167,11 +167,11 @@ int BitBangCaliperSerial(int * rx_words)
 		}
 
 		LastClockFlip = gpioTick();
-		errors += WaitClockChangeTo(0);
+		errors += WaitClockChangeTo(0,3);
 		duration = gpioTick()-LastClockFlip;
 		if (duration <= 1){
 			// Going high this briefly is most likely a glitch.
-			errors += ERR_GLITCH_COUNT;
+			errors += ERR_CL_GLITCH_COUNT;
 		}else{
 			break;
 		}
@@ -188,7 +188,7 @@ int BitBangCaliperSerial(int * rx_words)
 		//printf("Start too long\n");
 		return errors;
 	}
-
+	errors = 0; // We can accumulate a lotof "glitches" waiting for start, so reset that.
 	while (num_words < 2) {
 		int value = 0;
 		int bitval = 1;
@@ -203,13 +203,13 @@ int BitBangCaliperSerial(int * rx_words)
 		    bitval <<= 1;
 			if (sum > 1 && sum < num_average){
 				// Glitches on the data line are more worriesome, so count those as 4x.
-				errors += ERR_WRONG_BIT_COUNT*4;
+				errors += ERR_DL_GLITCH_COUNT;
 			}
 
-			errors += WaitClockChangeTo(1);
+			errors += WaitClockChangeTo(1,3);
 			if (errors & ERR_TIMEOUT) break;
 			LastClockFlip = gpioTick();
-			errors += WaitClockChangeTo(0);
+			errors += WaitClockChangeTo(0,3);
 			if (errors & ERR_TIMEOUT) break;
 			int duration = gpioTick()-LastClockFlip;
 
@@ -265,9 +265,16 @@ int main(int argc, char *argv[])
 		int rx_words[2];
 		int errors = BitBangCaliperSerial(rx_words);
 		if (errors > 0x100000){
-			printf("Decode fail, error %x\n",errors);
+			printf("Decode fail, error %x",errors);
+			if (errors & ERR_START_TOO_LONG) printf(",  start too long");
+		    if (errors & ERR_WRONG_BIT_COUNT) printf(",  Wrong bit count");
+		    if (errors & ERR_CLOCK_STUCK_LOW) printf(",  Clock stuck low");
+			if (errors ^ ERR_TIMEOUT) printf(",  Clock timeout");
+			putchar('\n');
+
 			// Larger errors mean decoding must have failed.
-			usleep(5000); // sleep past of rest of the serial message before trying again.
+			// sleep past of rest of the serial message before trying again.
+			usleep(1500);
 			continue;
 		}
 
@@ -280,7 +287,13 @@ int main(int argc, char *argv[])
 		//printf("i1=%08x i2=%08x  ", rx_words[0], rx_words[1]);
 		printf("i1=%8d i2=%8d  ", rx_words[0], rx_words[1]);
         printf("Abs:%8.3fmm  Disp:%8.3fmm", mm[0], mm[1]);
-		if (errors) printf("  Glitches: %x",errors);
+
+		if (errors){ // Print late and glitch counts
+			printf(" L:%d Gl:%2d,%d ",(errors >> 16) & 0x0f, errors & 0xff, (errors >> 8) & 0xff);
+			for (int a=0;a<(errors & 0xff);a++) putchar('g'); // Glitch count bargraph
+			for (int a=0;a<(errors & 0xff00);a+= 0x100) putchar('D'); // Glitch count bargraph
+			
+		}
 		putchar('\n');
 
 		if (SingleReadingMode) break;
